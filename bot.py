@@ -453,10 +453,12 @@ async def cb_partner_order(callback: CallbackQuery, bot: Bot) -> None:
         await callback.answer(f"❌ Заказ уже взят: {taken_by_str}", show_alert=True)
         return
 
+    admin_tag = f"@{callback.from_user.username}" if callback.from_user.username else callback.from_user.full_name
+
     await update_order_status(order_id, status="partner")
 
     orig = callback.message.caption or callback.message.text or ""
-    new_text = orig + "\n\n➡️ <b>Ожидает партнёра</b>"
+    new_text = orig + f"\n\n➡️ <b>Передал партнёру:</b> {admin_tag}"
 
     await edit_all_admin_messages(bot, order_id, new_text)
     await callback.answer("➡️ Заявка передана партнёру")

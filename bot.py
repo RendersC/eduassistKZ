@@ -183,10 +183,6 @@ def kb_admin(order_id: int) -> InlineKeyboardMarkup:
                     text="✅ Взять в работу",
                     callback_data=f"take_{order_id}",
                 ),
-                InlineKeyboardButton(
-                    text="➡️ Передать партнёру",
-                    callback_data=f"partner_{order_id}",
-                ),
             ]
         ]
     )

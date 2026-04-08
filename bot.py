@@ -57,7 +57,7 @@ logger = logging.getLogger(__name__)
 # ─── База данных ───────────────────────────────────────────────────────────────
 
 async def init_db() -> None:
-    """Создаёт таблицу заявок, если она ещё не существует."""
+    """Создаёт таблицы, если они ещё не существуют."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS orders (
@@ -69,10 +69,20 @@ async def init_db() -> None:
                 deadline    TEXT,
                 contact     TEXT,
                 file_id     TEXT,
-                file_type   TEXT,   -- 'document' или 'photo'
+                file_type   TEXT,
                 status      TEXT    DEFAULT 'new',
                 taken_by    TEXT,
                 created_at  TEXT
+            )
+        """)
+        # Таблица для хранения message_id уведомлений у каждого админа
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS order_messages (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id   INTEGER NOT NULL,
+                chat_id    INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                has_caption INTEGER DEFAULT 0  -- 1 если сообщение с фото/документом
             )
         """)
         await db.commit()
@@ -115,6 +125,27 @@ async def update_order_status(order_id: int, status: str, taken_by: str | None =
             (status, taken_by, order_id),
         )
         await db.commit()
+
+
+async def save_order_message(order_id: int, chat_id: int, message_id: int, has_caption: bool) -> None:
+    """Сохраняет message_id уведомления у конкретного админа."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO order_messages (order_id, chat_id, message_id, has_caption) VALUES (?, ?, ?, ?)",
+            (order_id, chat_id, message_id, 1 if has_caption else 0),
+        )
+        await db.commit()
+
+
+async def get_order_messages(order_id: int) -> list[tuple[int, int, bool]]:
+    """Возвращает список (chat_id, message_id, has_caption) для всех уведомлений заявки."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT chat_id, message_id, has_caption FROM order_messages WHERE order_id = ?",
+            (order_id,),
+        )
+        rows = await cursor.fetchall()
+    return [(r[0], r[1], bool(r[2])) for r in rows]
 
 # ─── FSM: шаги анкеты ──────────────────────────────────────────────────────────
 
@@ -182,23 +213,26 @@ async def notify_admins(bot: Bot, order_id: int, data: dict, message: Message) -
     for admin_id in ADMIN_CHAT_IDS:
         try:
             if file_id and file_type == "photo":
-                await bot.send_photo(
+                sent = await bot.send_photo(
                     admin_id, photo=file_id,
                     caption=text, parse_mode="HTML",
                     reply_markup=keyboard,
                 )
+                await save_order_message(order_id, admin_id, sent.message_id, has_caption=True)
             elif file_id and file_type == "document":
-                await bot.send_document(
+                sent = await bot.send_document(
                     admin_id, document=file_id,
                     caption=text, parse_mode="HTML",
                     reply_markup=keyboard,
                 )
+                await save_order_message(order_id, admin_id, sent.message_id, has_caption=True)
             else:
-                await bot.send_message(
+                sent = await bot.send_message(
                     admin_id, text,
                     parse_mode="HTML",
                     reply_markup=keyboard,
                 )
+                await save_order_message(order_id, admin_id, sent.message_id, has_caption=False)
         except Exception as e:
             logger.error("Ошибка отправки уведомления администратору %s: %s", admin_id, e)
 
@@ -354,48 +388,77 @@ async def step_contact(message: Message, state: FSMContext, bot: Bot) -> None:
 
 # ─── Callback-хендлеры для администраторов ────────────────────────────────────
 
+async def edit_all_admin_messages(bot: Bot, order_id: int, suffix: str) -> None:
+    """Редактирует уведомление о заявке у всех админов сразу."""
+    messages = await get_order_messages(order_id)
+    empty_kb = InlineKeyboardMarkup(inline_keyboard=[])
+    for chat_id, message_id, has_caption in messages:
+        try:
+            if has_caption:
+                await bot.edit_message_caption(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    caption=suffix,
+                    parse_mode="HTML",
+                    reply_markup=empty_kb,
+                )
+            else:
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=suffix,
+                    parse_mode="HTML",
+                    reply_markup=empty_kb,
+                )
+        except Exception as e:
+            logger.error("Ошибка редактирования у админа %s: %s", chat_id, e)
+
+
 @router.callback_query(F.data.startswith("take_"))
-async def cb_take_order(callback: CallbackQuery) -> None:
-    """Администратор берёт заявку в работу."""
-    order_id   = int(callback.data.split("_", 1)[1])
-    admin_name = callback.from_user.full_name
-    admin_tag  = f"@{callback.from_user.username}" if callback.from_user.username else admin_name
+async def cb_take_order(callback: CallbackQuery, bot: Bot) -> None:
+    """Администратор берёт заявку в работу — обновляется у всех."""
+    order_id  = int(callback.data.split("_", 1)[1])
+    admin_tag = f"@{callback.from_user.username}" if callback.from_user.username else callback.from_user.full_name
+
+    # Проверяем — не взят ли уже заказ другим менеджером
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT status, taken_by FROM orders WHERE id = ?", (order_id,))
+        row = await cursor.fetchone()
+    if row and row[0] != "new":
+        taken_by_str = row[1] or "партнёр"
+        await callback.answer(f"❌ Заказ уже взят: {taken_by_str}", show_alert=True)
+        return
 
     await update_order_status(order_id, status="taken", taken_by=admin_tag)
 
-    # Добавляем пометку к исходному сообщению, убираем кнопки
-    suffix = f"\n\n✅ <b>Взял в работу:</b> {admin_tag}"
-    try:
-        if callback.message.caption is not None:
-            new_text = callback.message.caption + suffix
-            await callback.message.edit_caption(caption=new_text, parse_mode="HTML", reply_markup=None)
-        else:
-            new_text = callback.message.text + suffix
-            await callback.message.edit_text(new_text, parse_mode="HTML", reply_markup=None)
-    except Exception as e:
-        logger.error("Ошибка редактирования сообщения (take): %s", e)
+    # Берём оригинальный текст из сообщения того, кто нажал, и добавляем пометку
+    orig = callback.message.caption or callback.message.text or ""
+    new_text = orig + f"\n\n✅ <b>Взял в работу:</b> {admin_tag}"
 
+    await edit_all_admin_messages(bot, order_id, new_text)
     await callback.answer("✅ Заявка взята в работу!")
 
 
 @router.callback_query(F.data.startswith("partner_"))
-async def cb_partner_order(callback: CallbackQuery) -> None:
-    """Администратор передаёт заявку партнёру."""
+async def cb_partner_order(callback: CallbackQuery, bot: Bot) -> None:
+    """Администратор передаёт заявку партнёру — обновляется у всех."""
     order_id = int(callback.data.split("_", 1)[1])
+
+    # Проверяем — не взят ли уже заказ
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT status, taken_by FROM orders WHERE id = ?", (order_id,))
+        row = await cursor.fetchone()
+    if row and row[0] != "new":
+        taken_by_str = row[1] or "партнёр"
+        await callback.answer(f"❌ Заказ уже взят: {taken_by_str}", show_alert=True)
+        return
 
     await update_order_status(order_id, status="partner")
 
-    suffix = "\n\n➡️ <b>Ожидает партнёра</b>"
-    try:
-        if callback.message.caption is not None:
-            new_text = callback.message.caption + suffix
-            await callback.message.edit_caption(caption=new_text, parse_mode="HTML", reply_markup=None)
-        else:
-            new_text = callback.message.text + suffix
-            await callback.message.edit_text(new_text, parse_mode="HTML", reply_markup=None)
-    except Exception as e:
-        logger.error("Ошибка редактирования сообщения (partner): %s", e)
+    orig = callback.message.caption or callback.message.text or ""
+    new_text = orig + "\n\n➡️ <b>Ожидает партнёра</b>"
 
+    await edit_all_admin_messages(bot, order_id, new_text)
     await callback.answer("➡️ Заявка передана партнёру")
 
 # ─── Запуск бота ───────────────────────────────────────────────────────────────

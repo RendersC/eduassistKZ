@@ -7,7 +7,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Копируем исходный код
+# Копируем исходный код и ресурсы
 COPY bot.py .
+COPY welcome.png .
 
 CMD ["python", "bot.py"]

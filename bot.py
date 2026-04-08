@@ -16,6 +16,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     CallbackQuery,
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -63,7 +64,6 @@ async def init_db() -> None:
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 tg_user_id  INTEGER NOT NULL,
                 username    TEXT,
-                university  TEXT,
                 subject     TEXT,
                 description TEXT,
                 deadline    TEXT,
@@ -86,14 +86,13 @@ async def save_order(data: dict, user_id: int, username: str | None) -> int:
         cursor = await db.execute(
             """
             INSERT INTO orders
-                (tg_user_id, username, university, subject, description,
+                (tg_user_id, username, subject, description,
                  deadline, contact, file_id, file_type, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'new', ?)
             """,
             (
                 user_id,
                 username,
-                data.get("university"),
                 data.get("subject"),
                 data.get("description"),
                 data.get("deadline"),
@@ -120,7 +119,6 @@ async def update_order_status(order_id: int, status: str, taken_by: str | None =
 # ─── FSM: шаги анкеты ──────────────────────────────────────────────────────────
 
 class OrderForm(StatesGroup):
-    university  = State()
     subject     = State()
     description = State()
     deadline    = State()
@@ -133,15 +131,6 @@ def kb_main() -> ReplyKeyboardMarkup:
     """Главное меню клиента."""
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="📝 Оставить заявку")]],
-        resize_keyboard=True,
-    )
-
-
-def kb_universities() -> ReplyKeyboardMarkup:
-    """Список университетов."""
-    unis = ["AITU", "KBTU", "ENU", "MNU", "Другой"]
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=u)] for u in unis],
         resize_keyboard=True,
     )
 
@@ -179,7 +168,6 @@ async def notify_admins(bot: Bot, order_id: int, data: dict, message: Message) -
     text = (
         f"🆕 <b>Новая заявка #{order_id}</b>\n\n"
         f"👤 <b>Клиент:</b> {message.from_user.full_name} ({username_str})\n"
-        f"🏫 <b>Университет:</b> {data.get('university')}\n"
         f"📖 <b>Предмет:</b> {data.get('subject')}\n"
         f"📝 <b>Описание:</b> {data.get('description')}\n"
         f"⏰ <b>Дедлайн:</b> {data.get('deadline')}\n"
@@ -219,34 +207,35 @@ async def notify_admins(bot: Bot, order_id: int, data: dict, message: Message) -
 router = Router()
 
 
+WELCOME_TEXT = (
+    "👋 Салем! Ты попал куда надо 😎\n\n"
+    "Помогаем со студенческими заданиями уже не первый семестр.\n"
+    "Лабы, курсовые, семинары — берёмся за всё.\n\n"
+    "⚡️ Оставь заявку — ответим быстро, сделаем чётко."
+)
+
+WELCOME_PHOTO = "welcome.png"  # файл лежит рядом с bot.py
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
-    """Приветственное сообщение при /start."""
+    """Приветственное сообщение с фото при /start."""
     await state.clear()
-    await message.answer(
-        "👋 <b>Добро пожаловать!</b>\n\n"
-        "Мы помогаем студентам с выполнением учебных заданий.\n"
-        "Нажмите кнопку ниже, чтобы оставить заявку.",
-        parse_mode="HTML",
-        reply_markup=kb_main(),
-    )
+    try:
+        photo = FSInputFile(WELCOME_PHOTO)
+        await message.answer_photo(
+            photo=photo,
+            caption=WELCOME_TEXT,
+            reply_markup=kb_main(),
+        )
+    except Exception:
+        # Если фото не найдено — отправляем просто текст
+        await message.answer(WELCOME_TEXT, reply_markup=kb_main())
 
 
 @router.message(F.text == "📝 Оставить заявку")
 async def start_order(message: Message, state: FSMContext) -> None:
-    """Начало анкеты — выбор университета."""
-    await state.set_state(OrderForm.university)
-    await message.answer(
-        "🏫 Выберите ваш университет:",
-        reply_markup=kb_universities(),
-    )
-
-
-# ── Шаг 1: Университет ────────────────────────────────────────────────────────
-
-@router.message(OrderForm.university)
-async def step_university(message: Message, state: FSMContext) -> None:
-    await state.update_data(university=message.text)
+    """Начало анкеты — сразу предмет."""
     await state.set_state(OrderForm.subject)
     await message.answer(
         "📖 Укажите предмет (например: Математика, Java, Экономика):",
@@ -254,13 +243,13 @@ async def step_university(message: Message, state: FSMContext) -> None:
     )
 
 
-# ── Шаг 2: Предмет ────────────────────────────────────────────────────────────
+# ── Шаг 1: Предмет ────────────────────────────────────────────────────────────
 
 @router.message(OrderForm.subject)
 async def step_subject(message: Message, state: FSMContext) -> None:
     await state.update_data(subject=message.text)
     await state.set_state(OrderForm.description)
-    await message.answer("📝 Опишите задание подробно:")
+    await message.answer("📝 Опишите задание:")
 
 
 # ── Шаг 3: Описание ───────────────────────────────────────────────────────────
